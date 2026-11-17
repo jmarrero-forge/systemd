@@ -25,6 +25,8 @@ at_exit() {
     rmdir /tmp/validatefs-test.fake
     umount /tmp/validatefs-test.tamper
     rmdir /tmp/validatefs-test.tamper
+    umount /tmp/validatefs-test.root
+    rmdir /tmp/validatefs-test.root
     rm -f /var/tmp/validatefs-test.raw /var/tmp/validatefs-test.pristine.raw /var/tmp/validatefs-test.bare.raw /tmp/validatefs-test.err
 }
 
@@ -101,6 +103,65 @@ getfattr --dump /tmp/validatefs-test.mount/home | grep user.validatefs.gpt_label
 getfattr --dump /tmp/validatefs-test.mount/home | grep user.validatefs.mount_point=\"/home\" >/dev/null
 /usr/lib/systemd/systemd-validatefs --root=/tmp/validatefs-test.mount /tmp/validatefs-test.mount/home
 (! /usr/lib/systemd/systemd-validatefs /tmp/validatefs-test.mount/home )
+
+# If /home is a symlink (as on OSTree), the file system recorded for /home is accepted where it points to,
+# but nowhere else. First with an absolute symlink, which only leads to the right place if it is resolved
+# inside the root, then with a relative one, as on OSTree.
+umount /tmp/validatefs-test.mount/home
+rmdir /tmp/validatefs-test.mount/home
+mkdir -p /tmp/validatefs-test.mount/var/home /tmp/validatefs-test.mount/srv
+udevadm wait --settle --timeout=30 /dev/disk/by-label/rupft
+for target in /var/home var/home; do
+    ln -sfn "$target" /tmp/validatefs-test.mount/home
+    mount /dev/disk/by-label/rupft /tmp/validatefs-test.mount/var/home
+    /usr/lib/systemd/systemd-validatefs --root=/tmp/validatefs-test.mount /tmp/validatefs-test.mount/var/home
+    umount /tmp/validatefs-test.mount/var/home
+    mount /dev/disk/by-label/rupft /tmp/validatefs-test.mount/srv
+    (! /usr/lib/systemd/systemd-validatefs --root=/tmp/validatefs-test.mount /tmp/validatefs-test.mount/srv )
+    umount /tmp/validatefs-test.mount/srv
+done
+
+# Symlinks inside the file system being validated must not be followed, as a symlink to "." in it would make
+# a listed path that leads below the mount point resolve to the mount point itself. Check that with /var/tmp
+# recorded and the file system mounted on /var, with /home leading to /var/home through the symlink in the
+# root and the file system mounted on /var, and with the file system mounted as the root.
+mount /dev/disk/by-label/rupft /tmp/validatefs-test.mount/var
+setfattr -n user.validatefs.mount_point -v /var/tmp /tmp/validatefs-test.mount/var
+ln -s . /tmp/validatefs-test.mount/var/tmp
+(! /usr/lib/systemd/systemd-validatefs --root=/tmp/validatefs-test.mount /tmp/validatefs-test.mount/var 2>/tmp/validatefs-test.err )
+grep "would look up '/tmp/validatefs-test.mount/var/tmp'" /tmp/validatefs-test.err >/dev/null
+rm /tmp/validatefs-test.mount/var/tmp
+setfattr -n user.validatefs.mount_point -v /home /tmp/validatefs-test.mount/var
+ln -s . /tmp/validatefs-test.mount/var/home
+(! /usr/lib/systemd/systemd-validatefs --root=/tmp/validatefs-test.mount /tmp/validatefs-test.mount/var 2>/tmp/validatefs-test.err )
+grep "would look up '/tmp/validatefs-test.mount/var/home'" /tmp/validatefs-test.err >/dev/null
+umount /tmp/validatefs-test.mount/var
+mkdir /tmp/validatefs-test.root
+mount /dev/disk/by-label/rupft /tmp/validatefs-test.root
+(! /usr/lib/systemd/systemd-validatefs --root=/tmp/validatefs-test.root /tmp/validatefs-test.root 2>/tmp/validatefs-test.err )
+grep "would look up '/tmp/validatefs-test.root/home'" /tmp/validatefs-test.err >/dev/null
+rm /tmp/validatefs-test.root/home
+getfattr --dump /tmp/validatefs-test.root | grep user.validatefs.mount_point=\"/home\" >/dev/null
+umount /tmp/validatefs-test.root
+rmdir /tmp/validatefs-test.root
+
+# A symlink loop in the root must be refused rather than resolved forever: with CHASE_STEP every chase() call
+# starts counting afresh, so only the step limit in validatefs ends the resolution. Check a symlink to itself
+# and a loop of two.
+mount /dev/disk/by-label/rupft /tmp/validatefs-test.mount/var/home
+ln -sfn home /tmp/validatefs-test.mount/home2
+for target in home home2; do
+    ln -sfn "$target" /tmp/validatefs-test.mount/home
+    (! timeout 30 /usr/lib/systemd/systemd-validatefs --root=/tmp/validatefs-test.mount /tmp/validatefs-test.mount/var/home 2>/tmp/validatefs-test.err )
+    grep "Too many levels of symlinks resolving '/home'" /tmp/validatefs-test.err >/dev/null
+done
+umount /tmp/validatefs-test.mount/var/home
+rm /tmp/validatefs-test.mount/home2
+
+rm /tmp/validatefs-test.mount/home
+rmdir /tmp/validatefs-test.mount/var/home /tmp/validatefs-test.mount/var /tmp/validatefs-test.mount/srv
+mkdir /tmp/validatefs-test.mount/home
+mount /dev/disk/by-label/rupft /tmp/validatefs-test.mount/home
 
 getfattr --dump /tmp/validatefs-test.mount/efi
 (! getfattr --dump /tmp/validatefs-test.mount/efi | grep user.validatefs.gpt_type_uuid= >/dev/null )
